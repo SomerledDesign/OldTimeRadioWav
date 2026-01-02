@@ -461,6 +461,7 @@ def load_wav_u8(path):
         if f.read(4) != b"WAVE":
             raise ValueError("Not WAVE")
         samplerate = 8000
+        fmt_ok = False
         while True:
             cid = f.read(4)
             if not cid:
@@ -468,8 +469,22 @@ def load_wav_u8(path):
             clen = ustruct.unpack("<I", f.read(4))[0]
             if cid == b"fmt ":
                 fmt = f.read(clen)
+                audio_format = ustruct.unpack("<H", fmt[0:2])[0]
+                channels = ustruct.unpack("<H", fmt[2:4])[0]
                 samplerate = ustruct.unpack("<I", fmt[4:8])[0]
+                bits_per_sample = ustruct.unpack("<H", fmt[14:16])[0]
+                if audio_format != 1 or channels != 1 or bits_per_sample != 8:
+                    raise ValueError(
+                        "AMradioSound.wav must be a mono 8-bit PCM WAV. "
+                        "Please convert the file and try again."
+                    )
+                fmt_ok = True
             elif cid == b"data":
+                if not fmt_ok:
+                    raise ValueError(
+                        "AMradioSound.wav is missing a valid WAV header. "
+                        "Please re-export the file as a standard WAV."
+                    )
                 data = f.read(clen)
                 break
             else:
@@ -570,10 +585,17 @@ def play_am_and_fade_df_confirming(folder, track):
     tim.init(freq=SR, mode=Timer.PERIODIC, callback=isr_cb)
 
     # DF fade steps spread across FADE_IN_S (or the AM length, whichever is shorter)
+    fade_total_ms = int(FADE_IN_S * 1000)
+    am_ms = int((len(data) * 1000) / SR) if SR > 0 else fade_total_ms
+    if am_ms > 0 and am_ms < fade_total_ms:
+        fade_total_ms = am_ms
     fade_steps = 20
-    fade_delay = int((FADE_IN_S * 1000) / fade_steps)
-    if fade_delay < 40:
-        fade_delay = 40
+    max_steps = max(1, fade_total_ms // 40) if fade_total_ms > 0 else 1
+    if fade_steps > max_steps:
+        fade_steps = max_steps
+    fade_delay = int(fade_total_ms / fade_steps) if fade_steps > 0 else 40
+    if fade_delay < 10:
+        fade_delay = 10
 
     confirmed = False
     confirm_deadline = time.ticks_add(time.ticks_ms(), BUSY_CONFIRM_MS)
