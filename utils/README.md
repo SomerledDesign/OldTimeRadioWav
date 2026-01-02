@@ -43,7 +43,7 @@ __m3u_to_dfplayer.py__
 - Can write the schedule to stdout with `-o stdout --verbose`.
 - Handles `file:///` URLs and URL-encoded paths from common playlist tools.
 
-~radio_playlist_config.example.yaml~
+*_radio_playlist_config.example.yaml_*
 - Example YAML config with comments and all supported fields.
 - Paths may be absolute or relative to the config file.
 - `relative_to` controls how M3U entries are written.
@@ -53,5 +53,11 @@ Notes
   `--ffprobe`/`--ffmpeg`).
 - `schedule.csv` is chronological from Monday 00:00:00 and is used by
   `src/main.py` to align playback to the current time.
-- DFPlayer playback order follows FAT copy order; copy files in order to the SD
-  card. On macOS, run `dot_clean /Volumes/SDCARD` after copying.
+- DFPlayer playback order follows FAT copy order; copy files in order to the SD card.
+- You can build the DFPlayer layout in a normal folder (for example
+  `~/Documents/tmp/DFPLAYER` or `C:\DFPLAYER`), then copy that folder to the
+  SD card mount (macOS: `/Volumes/SDCARD`, Windows: `E:\`).
+- Copy example (macOS/Linux): `rsync -a --inplace ~/Documents/tmp/DFPLAYER/ /Volumes/SDCARD/`
+  On macOS, run `dot_clean /Volumes/SDCARD` after copying.
+- Copy example (PowerShell): `robocopy "C:\\DFPLAYER" "E:\\" /E /COPY:DAT`
+- Copy example (CMD): `xcopy "C:\\DFPLAYER" "E:\\" /E /I /Y`
