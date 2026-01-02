@@ -1,0 +1,13 @@
+.vscode/
+Archive/
+Micropython/
+Raspberry Pi/
+Raspberry Pi/AMradioSound.wav
+Raspberry Pi/main.py
+.tmp/
+ezgif-split/
+__pycache__/
+*.pyc
+
+.DS_Store
+.micropico

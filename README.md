@@ -31,8 +31,7 @@ playlist so the device sounds like a live broadcast when it powers on.
 
 - `src/main.py` - Tiny2040 firmware (time alignment, playback, controls).
 - `utils/` - playlist generation and DFPlayer conversion scripts.
-- `Raspberry Pi/` - legacy reference copy (zionbrock baseline).
-- `Archive/` - archived files and references.
+- `include/` - optional assets kept in the repo.
 
 ## Typical Workflow
 
