@@ -3,13 +3,25 @@
 Helper scripts for building playlists and preparing DFPlayer-compatible SD card
 contents for the Old Time Radio project.
 
-Workflow (end-to-end)
-1. Generate an M3U playlist with `generate_radio_playlist.py`.
-2. Convert the M3U into DFPlayer folder/track layout and `schedule.csv` with
-   `m3u_to_dfplayer.py`.
-3. Copy the output folders to the SD card in order (FAT copy order matters).
+### Workflow (end-to-end)
 
-generate_radio_playlist.py
+<table>
+  <tr>
+    <td>1. Generate an M3U playlist with `generate_radio_playlist.py`.</td>
+    <td rowspan="3">
+      <img src="img/fcoM.gif" alt="FAT copy order Maters" height="120" width = "120" >
+    </td>
+  </tr>
+  <tr>
+    <td>2. Convert the M3U into DFPlayer folder/track layout and `schedule.csv` with
+   `m3u_to_dfplayer.py`.</td>
+  </tr>
+  <tr>
+    <td>3. Copy the output folders to the SD card in order (FAT copy order matters).</td>
+  </tr>
+</table>
+
+__generate_radio_playlist.py__
 - Builds an M3U playlist for N days using the per-hour structure:
   IDs -> newscast (if scheduled) -> 2 commercials -> songs to :30 ->
   IDs -> 1 commercial -> songs to :00.
@@ -23,7 +35,7 @@ generate_radio_playlist.py
 - Supports `--relative-to` to emit relative M3U paths when possible.
 - Supports YAML config via `--config` or `--write-config`.
 
-m3u_to_dfplayer.py
+__m3u_to_dfplayer.py__
 - Reads an M3U playlist and converts each entry to DFPlayer-compatible naming:
   folders `01..99` and tracks `001..255`.
 - Transcodes audio to CBR MP3 with `ffmpeg` (default 64 kbps, mono).
@@ -31,7 +43,7 @@ m3u_to_dfplayer.py
 - Can write the schedule to stdout with `-o stdout --verbose`.
 - Handles `file:///` URLs and URL-encoded paths from common playlist tools.
 
-radio_playlist_config.example.yaml
+~radio_playlist_config.example.yaml~
 - Example YAML config with comments and all supported fields.
 - Paths may be absolute or relative to the config file.
 - `relative_to` controls how M3U entries are written.
