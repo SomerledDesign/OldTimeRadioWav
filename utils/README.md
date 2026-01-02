@@ -5,7 +5,7 @@ contents for the Old Time Radio project.
 
 ### Workflow (end-to-end)
 
-<table>
+<table border cellpadding = "0"cellspacing = "0">
   <tr>
     <td>1. Generate an M3U playlist with `generate_radio_playlist.py`.</td>
     <td rowspan="3">
