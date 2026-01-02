@@ -1,12 +1,8 @@
 # Baseline 5.8 – Retro Radio (synced AM + DF fade, stable resume, Option A album wrap)
 # Option A: if next album (long-press) does not exist / does not confirm BUSY, wrap to Album 1 Track 1
 
-from machine import Pin, PWM, Timer, UART, I2C
-import neopixel, ustruct, time, sys
-try:
-    import uselect
-except ImportError:
-    uselect = None
+from machine import Pin, PWM, Timer, UART
+import neopixel, ustruct, time
 
 # ===========================
 #      CONFIGURATION
@@ -38,22 +34,6 @@ MAX_ALBUM_NUM   = 99             # folders 01..99 available
 BUSY_CONFIRM_MS = 1800           # how long we wait for BUSY low to confirm a track started
 POST_CMD_GUARD_MS = 120          # small pause between stop and play commands
 
-# RTC / Schedule
-I2C_ID          = 0
-PIN_I2C_SDA     = 4
-PIN_I2C_SCL     = 5
-I2C_FREQ        = 400_000
-RTC_ADDR        = 0x68
-
-# If set, we will write this time to the RTC when OSF is set (or when forced).
-# Format: (YYYY, MM, DD, HH, MM, SS)
-RTC_BOOTSTRAP_TIME = None
-RTC_FORCE_BOOTSTRAP = False
-RTC_SERIAL_SET_MS = 5000         # window to accept "SET YYYY-MM-DD HH:MM:SS" over USB serial
-
-SCHEDULE_FILE   = "schedule.csv" # folder,track,duration_s (chronological from Monday 00:00:00)
-ALIGN_ON_POWER_ON = True
-
 # ===========================
 #   NeoPixel + Pins
 # ===========================
@@ -80,297 +60,6 @@ KNOWN_TRACKS = {}
 
 # ignore BUSY edges after manual skips so they don't look like "track finished"
 ignore_busy_until = 0
-
-i2c = None
-
-# ===========================
-#   RTC (DS3231) + Schedule
-# ===========================
-
-def bcd_to_int(value):
-    return ((value >> 4) * 10) + (value & 0x0F)
-
-def int_to_bcd(value):
-    return ((value // 10) << 4) | (value % 10)
-
-def iso_weekday(year, month, day):
-    t = (0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4)
-    y = year - 1 if month < 3 else year
-    dow = (y + y // 4 - y // 100 + y // 400 + t[month - 1] + day) % 7
-    return 7 if dow == 0 else dow  # ISO: Monday=1..Sunday=7
-
-def seconds_into_week(dt):
-    year, month, day, hour, minute, second = dt
-    dow = iso_weekday(year, month, day)
-    return ((dow - 1) * 86400) + (hour * 3600) + (minute * 60) + second
-
-def rtc_init():
-    global i2c
-    try:
-        i2c = I2C(I2C_ID, scl=Pin(PIN_I2C_SCL), sda=Pin(PIN_I2C_SDA), freq=I2C_FREQ)
-        devices = i2c.scan()
-        if RTC_ADDR not in devices:
-            print("RTC: DS3231 not found on I2C bus:", devices)
-            i2c = None
-            return False
-        return True
-    except Exception as e:
-        print("RTC: I2C init failed:", e)
-        i2c = None
-        return False
-
-def rtc_osf_set():
-    if i2c is None:
-        return True
-    try:
-        status = i2c.readfrom_mem(RTC_ADDR, 0x0F, 1)[0]
-        return (status & 0x80) != 0
-    except Exception as e:
-        print("RTC: status read failed:", e)
-        return True
-
-def rtc_read_datetime():
-    if i2c is None:
-        return None
-    try:
-        data = i2c.readfrom_mem(RTC_ADDR, 0x00, 7)
-    except Exception as e:
-        print("RTC: read failed:", e)
-        return None
-
-    sec = bcd_to_int(data[0] & 0x7F)
-    minute = bcd_to_int(data[1] & 0x7F)
-    hour_raw = data[2]
-    if hour_raw & 0x40:  # 12h mode
-        hour = bcd_to_int(hour_raw & 0x1F)
-        if hour_raw & 0x20:
-            if hour != 12:
-                hour += 12
-        else:
-            if hour == 12:
-                hour = 0
-    else:
-        hour = bcd_to_int(hour_raw & 0x3F)
-
-    day = bcd_to_int(data[4] & 0x3F)
-    month = bcd_to_int(data[5] & 0x1F)
-    year = 2000 + bcd_to_int(data[6])
-    return (year, month, day, hour, minute, sec)
-
-def rtc_write_datetime(dt):
-    if i2c is None:
-        return False
-    year, month, day, hour, minute, second = dt
-    if not (2000 <= year <= 2099):
-        print("RTC: year out of range:", year)
-        return False
-    dow = iso_weekday(year, month, day)
-    payload = bytes([
-        int_to_bcd(second),
-        int_to_bcd(minute),
-        int_to_bcd(hour),          # 24h mode
-        int_to_bcd(dow),
-        int_to_bcd(day),
-        int_to_bcd(month),
-        int_to_bcd(year - 2000),
-    ])
-    try:
-        i2c.writeto_mem(RTC_ADDR, 0x00, payload)
-        status = i2c.readfrom_mem(RTC_ADDR, 0x0F, 1)[0]
-        i2c.writeto_mem(RTC_ADDR, 0x0F, bytes([status & 0x7F]))
-        return True
-    except Exception as e:
-        print("RTC: write failed:", e)
-        return False
-
-def read_serial_line(timeout_ms):
-    if uselect is None:
-        return None
-    poller = uselect.poll()
-    poller.register(sys.stdin, uselect.POLLIN)
-    buf = ""
-    deadline = time.ticks_add(time.ticks_ms(), timeout_ms)
-    while time.ticks_diff(time.ticks_ms(), deadline) < 0:
-        events = poller.poll(50)
-        if not events:
-            continue
-        try:
-            ch = sys.stdin.read(1)
-        except Exception:
-            ch = None
-        if not ch:
-            continue
-        if isinstance(ch, bytes):
-            ch = ch.decode()
-        if ch in ("\n", "\r"):
-            if buf:
-                return buf.strip()
-            buf = ""
-        else:
-            if len(buf) < 128:
-                buf += ch
-    return None
-
-def parse_datetime_line(line):
-    if not line:
-        return None
-    raw = line.strip()
-    if raw.upper().startswith("SET"):
-        raw = raw[3:].strip()
-        if raw.startswith("="):
-            raw = raw[1:].strip()
-    raw = raw.replace("T", " ")
-    parts = raw.split()
-    if not parts:
-        return None
-    date_part = parts[0]
-    time_part = parts[1] if len(parts) > 1 else "00:00:00"
-    sep = "-" if "-" in date_part else "/"
-    date_bits = date_part.split(sep)
-    if len(date_bits) != 3:
-        return None
-    try:
-        year = int(date_bits[0])
-        month = int(date_bits[1])
-        day = int(date_bits[2])
-        time_bits = time_part.split(":")
-        if len(time_bits) == 2:
-            hour = int(time_bits[0])
-            minute = int(time_bits[1])
-            second = 0
-        elif len(time_bits) == 3:
-            hour = int(time_bits[0])
-            minute = int(time_bits[1])
-            second = int(time_bits[2])
-        else:
-            return None
-    except ValueError:
-        return None
-    if not (2000 <= year <= 2099):
-        return None
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
-        return None
-    return (year, month, day, hour, minute, second)
-
-def maybe_set_rtc(force_serial=False):
-    if i2c is None:
-        return False
-    if RTC_FORCE_BOOTSTRAP and RTC_BOOTSTRAP_TIME:
-        if rtc_write_datetime(RTC_BOOTSTRAP_TIME):
-            print("RTC: set from bootstrap (forced)")
-            return True
-    osf = rtc_osf_set()
-    if osf:
-        print("RTC: OSF set (time may be invalid)")
-        if RTC_BOOTSTRAP_TIME:
-            if rtc_write_datetime(RTC_BOOTSTRAP_TIME):
-                print("RTC: set from bootstrap (OSF)")
-                return True
-    if RTC_SERIAL_SET_MS > 0 and (force_serial or osf):
-        print("RTC: send 'SET YYYY-MM-DD HH:MM:SS' over USB serial within", RTC_SERIAL_SET_MS, "ms")
-        line = read_serial_line(RTC_SERIAL_SET_MS)
-        if line:
-            dt = parse_datetime_line(line)
-            if dt and rtc_write_datetime(dt):
-                print("RTC: set from serial:", dt)
-                return True
-            print("RTC: invalid serial time:", line)
-    return False
-
-def parse_duration(value):
-    value = value.strip()
-    if ":" in value:
-        bits = value.split(":")
-        try:
-            parts = [int(p) for p in bits]
-        except ValueError:
-            return None
-        if len(parts) == 2:
-            return parts[0] * 60 + parts[1]
-        if len(parts) == 3:
-            return parts[0] * 3600 + parts[1] * 60 + parts[2]
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-def parse_schedule_line(line):
-    raw = line.strip()
-    if not raw or raw.startswith("#"):
-        return None
-    if "#" in raw:
-        raw = raw.split("#", 1)[0].strip()
-    if not raw:
-        return None
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) < 3:
-        return None
-    try:
-        folder = int(parts[0])
-        track = int(parts[1])
-    except ValueError:
-        return None
-    duration = parse_duration(parts[2])
-    if duration is None or duration <= 0:
-        return None
-    if folder < 1 or track < 1:
-        return None
-    return folder, track, duration
-
-def scan_schedule(target_sec):
-    folder_counts = {}
-    total = 0
-    found = None
-    try:
-        with open(SCHEDULE_FILE, "r") as f:
-            for line in f:
-                entry = parse_schedule_line(line)
-                if not entry:
-                    continue
-                folder, track, duration = entry
-                if folder > MAX_ALBUM_NUM:
-                    print("Schedule folder out of range:", folder)
-                    continue
-                if found is None and target_sec < (total + duration):
-                    found = (folder, track)
-                prev = folder_counts.get(folder, 0)
-                if track > prev:
-                    folder_counts[folder] = track
-                total += duration
-    except Exception as e:
-        print("Schedule read error:", e)
-        return None, {}, 0
-    return found, folder_counts, total
-
-def find_track_for_time(target_sec):
-    found, counts, total = scan_schedule(target_sec)
-    if total <= 0:
-        return None, {}, 0
-    if found is None:
-        wrapped = target_sec % total
-        found, _, _ = scan_schedule(wrapped)
-    return found, counts, total
-
-def align_to_time(reason=""):
-    global current_album, current_track, KNOWN_TRACKS
-    dt = rtc_read_datetime()
-    if not dt:
-        print("RTC: no valid time, skipping alignment")
-        return False
-    target = seconds_into_week(dt)
-    found, counts, total = find_track_for_time(target)
-    if not found:
-        print("Schedule align failed; keeping saved state")
-        return False
-    current_album, current_track = found
-    if counts:
-        KNOWN_TRACKS = counts
-    print("Aligned to time", dt, "-> album", current_album, "track", current_track, "(schedule seconds:", total, ")")
-    save_state("time align" + (":" + reason if reason else ""))
-    return True
 
 # ===========================
 #   DFPlayer helpers
@@ -699,13 +388,6 @@ while power_sense.value() == 0:
 print("GP14 HIGH detected.")
 load_state()
 
-if rtc_init():
-    force_serial = (button.value() == 0)
-    maybe_set_rtc(force_serial=force_serial)
-    align_to_time("boot")
-else:
-    print("RTC: init failed, using saved state")
-
 print("Giving DFPlayer time to boot:", DF_BOOT_MS, "ms")
 time.sleep_ms(DF_BOOT_MS)
 
@@ -839,8 +521,6 @@ while True:
             print("GP14 HIGH - Rail 2 power ON (pot turned ON)")
             rail2_on = True
             save_state("pot turned back on")
-            if ALIGN_ON_POWER_ON:
-                align_to_time("power on")
             print("Giving DFPlayer time to boot:", DF_BOOT_MS, "ms")
             time.sleep_ms(DF_BOOT_MS)
             start_sequence_synced()
@@ -848,3 +528,5 @@ while True:
 
     last_button = curr
     time.sleep_ms(10)
+
+

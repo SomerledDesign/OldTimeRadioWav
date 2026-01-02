@@ -10,14 +10,15 @@ A fork of zionbrock Radio player using the DFMini Player and a tiny2040.  This v
 
  ### Issues as I see them
 
- 1. DFMiniplayer doesn't use playlists persay.  The list is hard baked into the file system.
+ 1. DFMini player doesn't use playlists persay.  
+ 
+    - The list is hard baked into the file system.
  2. Generating the playlist
 
-    a. there is a github which has a playlist script converting m3u into heirarchal folders with the proper songs/newscasts/commercials set 
-
+    - there is a github which has a playlist script converting m3u into heirarchal folders with the proper songs/newscasts/commercials set 
 3. Procuring enough songs/newscast/commercials to cover an entire week.
-
-4. How big of a drive will that take?
-
-5. How big of a drive can the DFMini Player handle?
-
+4. No Amplifier is required.  Will output up to 3W
+5. Processes WAV, MP3, WMA Formats
+6. How big of a drive will that take?
+7. How big of a drive can the DFMini Player handle?
+   - Limited to 32GB

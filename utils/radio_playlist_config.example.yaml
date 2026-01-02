@@ -1,0 +1,29 @@
+# Radio Playlist Generator config (YAML)
+# Paths can be absolute or relative to this file.
+songs_dir: /path/to/songs
+commercials_dir: /path/to/commercials
+newscasts_dir: /path/to/newscasts
+ids_dir: /path/to/ids
+
+# If set, playlist entries are written relative to this path when possible.
+relative_to: /path/to
+
+# Output playlist file (relative to this file if not absolute).
+out: playlist.m3u
+
+# Schedule behavior.
+days: 30
+start_dow: mon
+newscast_hours: 6,12,18,22
+station_ids_per_break: 1
+commercials_first_half: 2
+commercials_second_half: 1
+
+# Audio selection.
+extensions: mp3
+max_overrun: 60
+seed:
+
+# Tools and cache.
+ffprobe:
+cache: .playlist_durations.json
