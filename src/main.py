@@ -1,8 +1,21 @@
-# Baseline 5.8 – Retro Radio (synced AM + DF fade, stable resume, Option A album wrap)
-# Option A: if next album (long-press) does not exist / does not confirm BUSY, wrap to Album 1 Track 1
+# Old Time Radio Wav - Tiny2040 + DFPlayer Mini time-aligned playback
+# Original concept: zionbrock (retro radio w/ DFPlayer Mini).
+#
+# This firmware expands the baseline into a time-aware, stateful player:
+# - DS3231 RTC alignment to a weekly schedule (schedule.csv).
+# - Synced AM intro + DFPlayer fade-in with BUSY confirmation.
+# - Robust resume: SD-state file + EEPROM fallback.
+# - EEPROM metadata: schedule checksum/mtime, last album/track, RTC-set flag.
+# - Button UX: tap/dual/triple/long with album wrap behavior.
+#
+# Design notes for advanced readers:
+# - PWM audio is intentionally simple (8-bit mono WAV) to keep timing stable.
+# - DFPlayer BUSY edges are debounced and ignored after manual skips.
+# - EEPROM writes are rate-limited to reduce wear.
+# - Schedule alignment uses ISO week semantics for deterministic playback.
 
-from machine import Pin, PWM, Timer, UART, I2C
-import neopixel, ustruct, time, sys
+from machine import Pin, PWM, Timer, UART, I2C, ADC
+import neopixel, ustruct, time, sys, uos, math
 try:
     import uselect
 except ImportError:
@@ -19,6 +32,7 @@ PIN_UART_TX     = 0
 PIN_UART_RX     = 1
 PIN_SENSE       = 14      # power sense from Rail 2
 PIN_BUSY        = 15      # DFPlayer BUSY (0 = playing, 1 = idle)
+PIN_POT_ADC     = 26      # ADC0 (Tiny2040 GP26) for volume pot
 
 VOLUME          = 1.0
 WAV_FILE        = "AMradioSound.wav"
@@ -43,6 +57,8 @@ I2C_ID          = 0
 PIN_I2C_SDA     = 4
 PIN_I2C_SCL     = 5
 I2C_FREQ        = 400_000
+# DS3231 RTC is fixed at 0x68. A0/A1/A2 pads on many modules are for the onboard
+# AT24C32 EEPROM (base 0x50): A2 A1 A0 = 000->0x50 ... 111->0x57 (default often 0x57).
 RTC_ADDR        = 0x68
 
 # If set, we will write this time to the RTC when OSF is set (or when forced).
@@ -53,6 +69,20 @@ RTC_SERIAL_SET_MS = 5000         # window to accept "SET YYYY-MM-DD HH:MM:SS" ov
 
 SCHEDULE_FILE   = "schedule.csv" # folder,track,duration_s (chronological from Monday 00:00:00)
 ALIGN_ON_POWER_ON = True
+
+# EEPROM (AT24C32 on common DS3231 modules)
+EEPROM_ADDR_DEFAULT = 0x57
+EEPROM_BASE_ADDR = 0x50
+EEPROM_MAX_ADDR = 0x57
+EEPROM_PAGE_SIZE = 32
+EEPROM_STATE_ADDR = 0x0000
+EEPROM_SAVE_MIN_MS = 60000
+
+# Volume pot behavior
+POT_ENABLED     = True
+POT_LOG_GAMMA   = 2.0     # >1.0 gives audio-taper feel (mid = less than half)
+POT_UPDATE_MS   = 150
+POT_DEADBAND    = 1
 
 # ===========================
 #   NeoPixel + Pins
@@ -74,6 +104,8 @@ MID = 32768
 
 current_album = 1
 current_track = 1
+df_volume = DFPLAYER_VOL
+fade_active = False
 
 # album -> highest track index confirmed to play
 KNOWN_TRACKS = {}
@@ -82,6 +114,18 @@ KNOWN_TRACKS = {}
 ignore_busy_until = 0
 
 i2c = None
+eeprom_addr = None
+last_eeprom_save_ms = 0
+eeprom_flags = 0
+
+EEPROM_MAGIC = b"OTR1"
+EEPROM_VERSION = 1
+EEPROM_FLAG_RTC_SET = 0x01
+EEPROM_STRUCT_FMT = "<4sBBBBHIIH"
+EEPROM_STRUCT_LEN = ustruct.calcsize(EEPROM_STRUCT_FMT)
+
+pot_adc = ADC(PIN_POT_ADC) if POT_ENABLED else None
+last_pot_update_ms = 0
 
 # ===========================
 #   RTC (DS3231) + Schedule
@@ -113,6 +157,7 @@ def rtc_init():
             print("RTC: DS3231 not found on I2C bus:", devices)
             i2c = None
             return False
+        detect_eeprom_addr(devices)
         return True
     except Exception as e:
         print("RTC: I2C init failed:", e)
@@ -182,6 +227,132 @@ def rtc_write_datetime(dt):
     except Exception as e:
         print("RTC: write failed:", e)
         return False
+
+def detect_eeprom_addr(devices=None):
+    global eeprom_addr
+    if i2c is None:
+        return None
+    if devices is None:
+        try:
+            devices = i2c.scan()
+        except Exception:
+            devices = []
+    for addr in range(EEPROM_BASE_ADDR, EEPROM_MAX_ADDR + 1):
+        if addr in devices:
+            eeprom_addr = addr
+            print("EEPROM: found at", hex(addr))
+            return addr
+    eeprom_addr = None
+    print("EEPROM: not found on I2C bus")
+    return None
+
+def eeprom_read(addr, length):
+    if i2c is None or eeprom_addr is None:
+        return None
+    try:
+        i2c.writeto(eeprom_addr, bytes([addr >> 8, addr & 0xFF]))
+        return i2c.readfrom(eeprom_addr, length)
+    except Exception as e:
+        print("EEPROM: read failed:", e)
+        return None
+
+def eeprom_write(addr, payload):
+    if i2c is None or eeprom_addr is None:
+        return False
+    try:
+        offset = 0
+        total = len(payload)
+        while offset < total:
+            page_off = (addr + offset) % EEPROM_PAGE_SIZE
+            chunk = min(EEPROM_PAGE_SIZE - page_off, total - offset)
+            header = bytes([((addr + offset) >> 8) & 0xFF, (addr + offset) & 0xFF])
+            i2c.writeto(eeprom_addr, header + payload[offset:offset + chunk])
+            time.sleep_ms(6)
+            offset += chunk
+        return True
+    except Exception as e:
+        print("EEPROM: write failed:", e)
+        return False
+
+def checksum16(data):
+    total = 0
+    for b in data:
+        total = (total + b) & 0xFFFF
+    return total
+
+def get_schedule_checksum():
+    try:
+        with open(SCHEDULE_FILE, "rb") as f:
+            data = f.read()
+        return checksum16(data)
+    except Exception:
+        return 0
+
+def get_schedule_mtime():
+    try:
+        stat = uos.stat(SCHEDULE_FILE)
+        if len(stat) >= 9:
+            return int(stat[8])
+    except Exception:
+        pass
+    return 0
+
+def eeprom_load_state():
+    if i2c is None or eeprom_addr is None:
+        return None
+    raw = eeprom_read(EEPROM_STATE_ADDR, EEPROM_STRUCT_LEN)
+    if not raw or len(raw) != EEPROM_STRUCT_LEN:
+        return None
+    try:
+        (magic, version, flags, album, track,
+         sched_sum, sched_mtime, week_sec, crc) = ustruct.unpack(EEPROM_STRUCT_FMT, raw)
+    except Exception:
+        return None
+    if magic != EEPROM_MAGIC or version != EEPROM_VERSION:
+        return None
+    if checksum16(raw[:-2]) != crc:
+        print("EEPROM: checksum mismatch")
+        return None
+    return {
+        "flags": flags,
+        "album": album,
+        "track": track,
+        "schedule_checksum": sched_sum,
+        "schedule_mtime": sched_mtime,
+        "week_seconds": week_sec,
+    }
+
+def eeprom_save_state(flags, album, track):
+    global last_eeprom_save_ms
+    if i2c is None or eeprom_addr is None:
+        return False
+    now = time.ticks_ms()
+    if last_eeprom_save_ms and time.ticks_diff(now, last_eeprom_save_ms) < EEPROM_SAVE_MIN_MS:
+        return False
+    sched_sum = get_schedule_checksum()
+    sched_mtime = get_schedule_mtime()
+    week_sec = 0
+    dt = rtc_read_datetime()
+    if dt:
+        week_sec = seconds_into_week(dt)
+    payload = ustruct.pack(
+        EEPROM_STRUCT_FMT,
+        EEPROM_MAGIC,
+        EEPROM_VERSION,
+        flags & 0xFF,
+        album & 0xFF,
+        track & 0xFF,
+        sched_sum & 0xFFFF,
+        sched_mtime & 0xFFFFFFFF,
+        week_sec & 0xFFFFFFFF,
+        0,
+    )
+    crc = checksum16(payload[:-2])
+    payload = payload[:-2] + ustruct.pack("<H", crc)
+    if eeprom_write(EEPROM_STATE_ADDR, payload):
+        last_eeprom_save_ms = now
+        return True
+    return False
 
 def read_serial_line(timeout_ms):
     if uselect is None:
@@ -255,11 +426,14 @@ def parse_datetime_line(line):
     return (year, month, day, hour, minute, second)
 
 def maybe_set_rtc(force_serial=False):
+    global eeprom_flags
     if i2c is None:
         return False
     if RTC_FORCE_BOOTSTRAP and RTC_BOOTSTRAP_TIME:
         if rtc_write_datetime(RTC_BOOTSTRAP_TIME):
             print("RTC: set from bootstrap (forced)")
+            eeprom_flags |= EEPROM_FLAG_RTC_SET
+            eeprom_save_state(eeprom_flags, current_album, current_track)
             return True
     osf = rtc_osf_set()
     if osf:
@@ -267,6 +441,8 @@ def maybe_set_rtc(force_serial=False):
         if RTC_BOOTSTRAP_TIME:
             if rtc_write_datetime(RTC_BOOTSTRAP_TIME):
                 print("RTC: set from bootstrap (OSF)")
+                eeprom_flags |= EEPROM_FLAG_RTC_SET
+                eeprom_save_state(eeprom_flags, current_album, current_track)
                 return True
     if RTC_SERIAL_SET_MS > 0 and (force_serial or osf):
         print("RTC: send 'SET YYYY-MM-DD HH:MM:SS' over USB serial within", RTC_SERIAL_SET_MS, "ms")
@@ -275,6 +451,8 @@ def maybe_set_rtc(force_serial=False):
             dt = parse_datetime_line(line)
             if dt and rtc_write_datetime(dt):
                 print("RTC: set from serial:", dt)
+                eeprom_flags |= EEPROM_FLAG_RTC_SET
+                eeprom_save_state(eeprom_flags, current_album, current_track)
                 return True
             print("RTC: invalid serial time:", line)
     return False
@@ -404,6 +582,36 @@ def df_stop():
     df_send(0x16, 0, 0)
 
 # ===========================
+#   Volume pot helpers
+# ===========================
+
+def pot_target_volume():
+    if pot_adc is None:
+        return DFPLAYER_VOL
+    raw = pot_adc.read_u16()
+    x = raw / 65535
+    if x < 0:
+        x = 0
+    if x > 1:
+        x = 1
+    gamma = POT_LOG_GAMMA if POT_LOG_GAMMA > 0 else 1.0
+    y = math.pow(x, gamma)
+    return int(round(y * DFPLAYER_VOL))
+
+def update_volume_from_pot(force=False):
+    global df_volume, last_pot_update_ms
+    if pot_adc is None or fade_active:
+        return
+    now = time.ticks_ms()
+    if not force and time.ticks_diff(now, last_pot_update_ms) < POT_UPDATE_MS:
+        return
+    last_pot_update_ms = now
+    target = pot_target_volume()
+    if force or abs(target - df_volume) >= POT_DEADBAND:
+        df_volume = target
+        df_set_vol(df_volume)
+
+# ===========================
 #   Album state save / load
 # ===========================
 
@@ -431,12 +639,14 @@ def load_state():
 
         print("Loaded album", current_album, "track", current_track)
         print("Loaded KNOWN_TRACKS:", KNOWN_TRACKS)
+        return True
 
     except Exception as e:
         print("No valid album_state.txt, starting fresh. Reason:", e)
         current_album = 1
         current_track = 1
         KNOWN_TRACKS = {}
+        return False
 
 def save_state(reason=""):
     global current_album, current_track, KNOWN_TRACKS
@@ -446,6 +656,7 @@ def save_state(reason=""):
         with open(ALBUM_FILE, "w") as f:
             f.write(payload)
         print("Saved state", ("[" + reason + "]" if reason else ""), ":", payload)
+        eeprom_save_state(eeprom_flags, current_album, current_track)
     except Exception as e:
         print("State save error:", e)
 
@@ -531,7 +742,7 @@ def play_am_and_fade_df_confirming(folder, track):
     During the fade, we watch BUSY for a confirmation that DF actually started.
     Returns True if we confirm BUSY LOW at any point during the AM window.
     """
-    global pwm, tim
+    global pwm, tim, fade_active
 
     # Start DF track immediately (synced start)
     df_stop()
@@ -600,9 +811,10 @@ def play_am_and_fade_df_confirming(folder, track):
     confirmed = False
     confirm_deadline = time.ticks_add(time.ticks_ms(), BUSY_CONFIRM_MS)
 
+    fade_active = True
     try:
         for step in range(fade_steps + 1):
-            df_set_vol(int((step / fade_steps) * DFPLAYER_VOL))
+            df_set_vol(int((step / fade_steps) * df_volume))
 
             # while we wait between volume steps, keep checking BUSY
             t_start = time.ticks_ms()
@@ -627,6 +839,7 @@ def play_am_and_fade_df_confirming(folder, track):
             time.sleep_ms(20)
 
     finally:
+        fade_active = False
         try:
             tim.deinit()
         except:
@@ -670,7 +883,7 @@ def start_sequence_synced():
     print("No BUSY LOW in confirm window (will second-chance after AM ends).")
     print("Second-chance: re-trigger DF after AM")
     df_reset()
-    df_set_vol(DFPLAYER_VOL)
+    df_set_vol(df_volume)
     df_stop()
     time.sleep_ms(POST_CMD_GUARD_MS)
     df_play_folder_track(current_album, current_track)
@@ -719,7 +932,7 @@ while power_sense.value() == 0:
     time.sleep_ms(20)
 
 print("GP14 HIGH detected.")
-load_state()
+loaded_file = load_state()
 
 if rtc_init():
     force_serial = (button.value() == 0)
@@ -728,9 +941,18 @@ if rtc_init():
 else:
     print("RTC: init failed, using saved state")
 
+saved = eeprom_load_state()
+if saved:
+    eeprom_flags = int(saved.get("flags", 0)) & 0xFF
+    if not loaded_file:
+        current_album = max(1, int(saved.get("album", 1)))
+        current_track = max(1, int(saved.get("track", 1)))
+        print("Loaded state from EEPROM:", current_album, current_track)
+
 print("Giving DFPlayer time to boot:", DF_BOOT_MS, "ms")
 time.sleep_ms(DF_BOOT_MS)
 
+df_volume = pot_target_volume()
 start_sequence_synced()
 
 # ===========================
@@ -869,4 +1091,5 @@ while True:
         last_sense = sense
 
     last_button = curr
+    update_volume_from_pot()
     time.sleep_ms(10)

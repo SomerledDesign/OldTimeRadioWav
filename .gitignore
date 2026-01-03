@@ -1,13 +1,14 @@
+# Folders you don't want to go into.
 .vscode/
 Archive/
 Micropython/
 Raspberry Pi/
-Raspberry Pi/AMradioSound.wav
-Raspberry Pi/main.py
 .tmp/
 ezgif-split/
 __pycache__/
+
+# extensions you have no business looking at
 *.pyc
 
+# macOS breadcrumbs
 .DS_Store
-.micropico
